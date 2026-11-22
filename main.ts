@@ -1,412 +1,124 @@
-// Push-optimal Sokoban solver for the make.fun sokoban-solver-01 bounty.
-//
-// Approach
-// --------
-// Scoring counts pushes, not steps, so the search runs over pushes: a state is
-// the set of box squares plus the region the player can reach without pushing
-// (named by its lowest square). Breadth-first search over pushes is optimal by
-// construction. Two cheap deadlock prunes keep the frontier small without ever
-// cutting a solvable state:
-//
-//   * dead squares — squares from which a lone box can never be pushed onto a
-//     goal (found by pulling boxes backwards from every goal over open floor);
-//   * frozen 2x2 blocks — four squares of wall/box with a box off its goal.
-//
-// Generated levels are a hallway with independent rooms off it: a box pushed
-// out of its room can never come back, so the level splits into rooms (cut the
-// dead squares of the player's row out of the floor and take the components
-// that hold boxes). Each room is solved on its own with the other rooms' boxes
-// standing as walls, and the room optima add up to the level optimum. When a
-// level does not split cleanly, the same push search runs over the whole board.
-//
-// Everything is deterministic: fixed direction order, state-count budgets
-// instead of clocks, no randomness. Node standard library only.
-
-import { mkdirSync, readdirSync, readFileSync, writeFileSync } from 'node:fs';
-import { join } from 'node:path';
-
-const INPUT_DIR = process.env.MAKEFUN_INPUT_DIR ?? '/input';
-const OUTPUT_DIR = process.env.MAKEFUN_OUTPUT_DIR ?? '/output';
-
-/** Per-search state budgets (deterministic work limits, never the clock). */
-const ROOM_STATE_BUDGET = 2_000_000;
-const WHOLE_STATE_BUDGET = 3_000_000;
-
-/** Directions in a fixed order: [dx, dy, walk letter, push letter]. */
-const DIRS: ReadonlyArray<readonly [number, number, string, string]> = [
-  [0, -1, 'u', 'U'],
-  [0, 1, 'd', 'D'],
-  [-1, 0, 'l', 'L'],
-  [1, 0, 'r', 'R'],
-];
-
-interface Level {
-  w: number;
-  h: number;
-  wall: Uint8Array;
-  goals: number[];
-  boxes: number[];
-  player: number;
+// Push-optimal Sokoban solver (make.fun sokoban-solver-01). Search over pushes
+// (state = box squares + player's reachable region), BFS = push-optimal. Prunes:
+// dead squares (reverse pull from goals) and frozen 2x2 blocks. Levels split
+// into rooms by cutting the hallway's dead squares from the player's row; each
+// room is solved alone (other rooms' boxes as walls) and the optima add up.
+// Deterministic: fixed direction order, state budgets, no clock, stdlib only.
+import { mkdirSync as M, readdirSync as R, readFileSync as F, writeFileSync as W } from 'node:fs';
+import { join as J } from 'node:path';
+const I = process.env.MAKEFUN_INPUT_DIR ?? '/input', O = process.env.MAKEFUN_OUTPUT_DIR ?? '/output';
+const D = [[0, -1, 'u', 'U'], [0, 1, 'd', 'D'], [-1, 0, 'l', 'L'], [1, 0, 'r', 'R']];
+function parse(t) {
+  const rows = t.split('\n').filter(r => r.length), h = rows.length, w = Math.max(...rows.map(r => r.length));
+  const wall = new Uint8Array(w * h).fill(1), g = [], b = []; let p = -1;
+  rows.forEach((row, y) => { for (let x = 0; x < row.length; x++) { const c = row[x], i = y * w + x; if (c === '#') continue; wall[i] = 0; if ('.*+'.includes(c)) g.push(i); if ('$*'.includes(c)) b.push(i); if ('@+'.includes(c)) p = i; } });
+  for (let x = 0; x < w; x++) { wall[x] = 1; wall[(h - 1) * w + x] = 1; } for (let y = 0; y < h; y++) { wall[y * w] = 1; wall[y * w + w - 1] = 1; }
+  b.sort((a, c) => a - c); g.sort((a, c) => a - c); return { w, wall, g, b, p };
 }
-
-/** Parse XSB text. Squares outside the text and on the outer frame are walls. */
-function parseLevel(text: string): Level {
-  const rows = text.split('\n').filter((r) => r.length > 0);
-  const h = rows.length;
-  const w = Math.max(...rows.map((r) => r.length));
-  const wall = new Uint8Array(w * h).fill(1);
-  const goals: number[] = [];
-  const boxes: number[] = [];
-  let player = -1;
-  rows.forEach((row, y) => {
-    for (let x = 0; x < row.length; x++) {
-      const ch = row[x];
-      const i = y * w + x;
-      if (ch === '#') continue;
-      wall[i] = 0;
-      if (ch === '.' || ch === '*' || ch === '+') goals.push(i);
-      if (ch === '$' || ch === '*') boxes.push(i);
-      if (ch === '@' || ch === '+') player = i;
-    }
-  });
-  for (let x = 0; x < w; x++) {
-    wall[x] = 1;
-    wall[(h - 1) * w + x] = 1;
-  }
-  for (let y = 0; y < h; y++) {
-    wall[y * w] = 1;
-    wall[y * w + w - 1] = 1;
-  }
-  boxes.sort((a, b) => a - b);
-  goals.sort((a, b) => a - b);
-  return { w, h, wall, goals, boxes, player };
+function live(w, wall, goals) {
+  const L = new Uint8Array(wall.length), q = [];
+  for (const g of goals) { L[g] = 1; q.push(g); }
+  for (let i = 0; i < q.length; i++) { const x = q[i]; for (const [dx, dy] of D) { const d = dy * w + dx, y = x - d; if (y >= 0 && y < wall.length && !wall[y] && !wall[y - d] && !L[y]) { L[y] = 1; q.push(y); } } }
+  return L;
 }
-
-/**
- * Squares from which a box can reach some goal, ignoring the other boxes:
- * start from the goals and pull a box backwards — a box can be pulled from
- * square y into square x when both x and the square behind the player are
- * open floor.
- */
-function liveSquares(w: number, wall: Uint8Array, goals: number[]): Uint8Array {
-  const live = new Uint8Array(wall.length);
-  const queue: number[] = [];
-  for (const g of goals) {
-    live[g] = 1;
-    queue.push(g);
-  }
-  for (let head = 0; head < queue.length; head++) {
-    const x = queue[head];
-    for (const [dx, dy] of DIRS) {
-      const d = dy * w + dx;
-      const y = x - d;
-      if (y < 0 || y >= wall.length) continue;
-      if (!wall[y] && !wall[y - d] && !live[y]) {
-        live[y] = 1;
-        queue.push(y);
-      }
-    }
-  }
-  return live;
-}
-
-/** Flood fill of the player's reachable region; returns its lowest square. */
-function floodRegion(
-  w: number,
-  wall: Uint8Array,
-  blocked: Uint8Array,
-  from: number,
-  seen: Int32Array,
-  stamp: number,
-  stack: Int32Array,
-): number {
-  let low = from;
-  let n = 0;
-  stack[n++] = from;
-  seen[from] = stamp;
-  while (n > 0) {
-    const p = stack[--n];
-    if (p < low) low = p;
-    const neighbours = [p - w, p + w, p - 1, p + 1];
-    for (const q of neighbours) {
-      if (q >= 0 && q < wall.length && wall[q] === 0 && blocked[q] === 0 && seen[q] !== stamp) {
-        seen[q] = stamp;
-        stack[n++] = q;
-      }
-    }
-  }
+function flood(w, wall, blk, from, seen, stamp, st) {
+  let low = from, n = 0; st[n++] = from; seen[from] = stamp;
+  while (n) { const p = st[--n]; if (p < low) low = p; for (const q of [p - w, p + w, p - 1, p + 1]) if (q >= 0 && q < wall.length && !wall[q] && !blk[q] && seen[q] !== stamp) { seen[q] = stamp; st[n++] = q; } }
   return low;
 }
-
-/** True when the box just pushed to t froze inside a solid 2x2 of walls/boxes. */
-function frozenSquare(
-  w: number,
-  wall: Uint8Array,
-  blocked: Uint8Array,
-  goalSet: Uint8Array,
-  t: number,
-): boolean {
-  const solid = (i: number): boolean => wall[i] === 1 || blocked[i] === 1;
-  for (const a of [t, t - 1, t - w, t - w - 1]) {
-    const b = a + 1;
-    const c = a + w;
-    const d = c + 1;
-    if (d >= wall.length) continue;
-    if (!solid(a) || !solid(b) || !solid(c) || !solid(d)) continue;
-    const offGoal = (i: number): boolean => blocked[i] === 1 && goalSet[i] === 0;
-    if (offGoal(a) || offGoal(b) || offGoal(c) || offGoal(d)) return true;
-  }
+function frozen(w, wall, blk, goal, t) {
+  const s = i => wall[i] || blk[i], off = i => blk[i] && !goal[i];
+  for (const a of [t, t - 1, t - w, t - w - 1]) { const b = a + 1, c = a + w, d = c + 1; if (d < wall.length && s(a) && s(b) && s(c) && s(d) && (off(a) || off(b) || off(c) || off(d))) return true; }
   return false;
 }
-
-/** Shortest walk from `from` to `to` avoiding walls and boxes, as walk letters. */
-function walkPath(
-  w: number,
-  wall: Uint8Array,
-  blocked: Uint8Array,
-  from: number,
-  to: number,
-): string {
+function walk(w, wall, blk, from, to) {
   if (from === to) return '';
-  const prev = new Int32Array(wall.length).fill(-1);
-  const letter = new Array<string>(wall.length);
-  const queue = [from];
-  prev[from] = from;
-  for (let head = 0; head < queue.length; head++) {
-    const p = queue[head];
-    if (p === to) break;
-    for (const [dx, dy, walk] of DIRS) {
-      const q = p + dy * w + dx;
-      if (q < 0 || q >= wall.length) continue;
-      if (wall[q] || blocked[q] || prev[q] !== -1) continue;
-      prev[q] = p;
-      letter[q] = walk;
-      queue.push(q);
-    }
-  }
-  if (prev[to] === -1) throw new Error('walkPath: target out of reach');
-  let out = '';
-  for (let p = to; p !== from; p = prev[p]) out = letter[p] + out;
-  return out;
+  const prev = new Int32Array(wall.length).fill(-1), let2 = new Array(wall.length), q = [from]; prev[from] = from;
+  for (let i = 0; i < q.length; i++) { const p = q[i]; if (p === to) break; for (const [dx, dy, c] of D) { const n = p + dy * w + dx; if (n < 0 || n >= wall.length || wall[n] || blk[n] || prev[n] !== -1) continue; prev[n] = p; let2[n] = c; q.push(n); } }
+  let s = ''; for (let p = to; p !== from; p = prev[p]) s = let2[p] + s; return s;
 }
-
-interface PushSolution {
-  pushes: number;
-  moves: string;
-}
-
-/**
- * Breadth-first search over pushes on one board (a room, or a whole level).
- * Returns the push-optimal solution, or null when the budget runs out or the
- * board is unsolvable.
- */
-function solvePushBfs(
-  w: number,
-  wall: Uint8Array,
-  goals: number[],
-  startBoxes: number[],
-  startPlayer: number,
-  budget: number,
-): PushSolution | null {
-  const size = wall.length;
-  const goalSet = new Uint8Array(size);
-  for (const g of goals) goalSet[g] = 1;
-  const live = liveSquares(w, wall, goals);
-  if (startBoxes.some((b) => !live[b])) return null;
-
-  const blocked = new Uint8Array(size);
-  const seen = new Int32Array(size);
-  const mark = new Int32Array(size);
-  const stack = new Int32Array(size);
+function bfs(w, wall, goals, boxes0, player0, budget) {
+  const size = wall.length, goal = new Uint8Array(size);
+  for (const g of goals) goal[g] = 1;
+  const lv = live(w, wall, goals);
+  if (boxes0.some(b => !lv[b])) return null;
+  const blk = new Uint8Array(size), seen = new Int32Array(size), mark = new Int32Array(size), st = new Int32Array(size);
   let stamp = 0;
-
-  // Numeric state key: the region's lowest square followed by the sorted box
-  // squares, packed in base `size` (exact while size^(boxes+1) < 2^53).
-  const packKey = (boxes: number[], low: number): number => {
-    let k = low;
-    for (const b of boxes) k = k * size + b;
-    return k;
-  };
-
-  const allOnGoals = (boxes: number[]): boolean => boxes.every((b) => goalSet[b] === 1);
-
-  // State store: parallel arrays; parent + the push that created the state.
-  const stateBoxes: number[][] = [startBoxes.slice()];
-  const statePlayer: number[] = [startPlayer];
-  const stateParent: number[] = [-1];
-  const statePushBox: number[] = [-1]; // box square before the push
-  const statePushDir: number[] = [-1]; // direction index of the push
-  const visited = new Map<number, number>();
-
-  for (const b of startBoxes) blocked[b] = 1;
-  const startLow = floodRegion(w, wall, blocked, startPlayer, seen, ++stamp, stack);
-  visited.set(packKey(startBoxes, startLow), 0);
-  for (const b of startBoxes) blocked[b] = 0;
-
-  let found = allOnGoals(startBoxes) ? 0 : -1;
-  for (let head = 0; head < stateBoxes.length && found < 0; head++) {
-    const boxes = stateBoxes[head];
-    for (const b of boxes) blocked[b] = 1;
-    floodRegion(w, wall, blocked, statePlayer[head], seen, ++stamp, stack);
-    const regionStamp = stamp;
-
-    for (let bi = 0; bi < boxes.length && found < 0; bi++) {
-      const b = boxes[bi];
+  const key = (bs, low) => { let k = low; for (const b of bs) k = k * size + b; return k; };
+  const done = bs => bs.every(b => goal[b]);
+  const SB = [boxes0.slice()], SP = [player0], PA = [-1], PB = [-1], PD = [-1], vis = new Map();
+  for (const b of boxes0) blk[b] = 1;
+  vis.set(key(boxes0, flood(w, wall, blk, player0, seen, ++stamp, st)), 0);
+  for (const b of boxes0) blk[b] = 0;
+  let found = done(boxes0) ? 0 : -1;
+  for (let head = 0; head < SB.length && found < 0; head++) {
+    const bs = SB[head];
+    for (const b of bs) blk[b] = 1;
+    flood(w, wall, blk, SP[head], seen, ++stamp, st);
+    const reg = stamp;
+    for (let bi = 0; bi < bs.length && found < 0; bi++) {
+      const b = bs[bi];
       for (let di = 0; di < 4; di++) {
-        const [dx, dy] = DIRS[di];
-        const d = dy * w + dx;
-        const target = b + d;
-        const stand = b - d;
-        if (seen[stand] !== regionStamp) continue; // player cannot stand there
-        if (wall[target] || blocked[target] || !live[target]) continue;
-
-        blocked[b] = 0;
-        blocked[target] = 1;
-        const frozen = frozenSquare(w, wall, blocked, goalSet, target);
-        let key = -1;
-        let nextBoxes: number[] | null = null;
-        if (!frozen) {
-          nextBoxes = boxes.slice();
-          nextBoxes[bi] = target;
-          nextBoxes.sort((a, c) => a - c);
-          const low = floodRegion(w, wall, blocked, b, mark, ++stamp, stack);
-          key = packKey(nextBoxes, low);
-        }
-        blocked[target] = 0;
-        blocked[b] = 1;
-        if (frozen || nextBoxes === null || visited.has(key)) continue;
-        if (stateBoxes.length >= budget) {
-          for (const x of boxes) blocked[x] = 0;
-          return null;
-        }
-        const id = stateBoxes.length;
-        visited.set(key, id);
-        stateBoxes.push(nextBoxes);
-        statePlayer.push(b); // after the push the player stands on the box's old square
-        stateParent.push(head);
-        statePushBox.push(b);
-        statePushDir.push(di);
-        if (allOnGoals(nextBoxes)) found = id;
+        const d = D[di][1] * w + D[di][0], t = b + d;
+        if (seen[b - d] !== reg || wall[t] || blk[t] || !lv[t]) continue;
+        blk[b] = 0; blk[t] = 1;
+        const fz = frozen(w, wall, blk, goal, t);
+        let k = -1, nb = null;
+        if (!fz) { nb = bs.slice(); nb[bi] = t; nb.sort((a, c) => a - c); k = key(nb, flood(w, wall, blk, b, mark, ++stamp, st)); }
+        blk[t] = 0; blk[b] = 1;
+        if (fz || !nb || vis.has(k)) continue;
+        if (SB.length >= budget) { for (const x of bs) blk[x] = 0; return null; }
+        vis.set(k, SB.length); SB.push(nb); SP.push(b); PA.push(head); PB.push(b); PD.push(di);
+        if (done(nb)) found = SB.length - 1;
       }
     }
-    for (const b of boxes) blocked[b] = 0;
+    for (const b of bs) blk[b] = 0;
   }
   if (found < 0) return null;
-
-  // Rebuild the move string: walk to each push position, then push.
-  const chain: number[] = [];
-  for (let s = found; s > 0; s = stateParent[s]) chain.push(s);
-  chain.reverse();
-  let moves = '';
-  let player = startPlayer;
-  let boxes = startBoxes;
+  const chain = []; for (let s = found; s > 0; s = PA[s]) chain.push(s); chain.reverse();
+  let moves = '', player = player0, bs = boxes0;
   for (const s of chain) {
-    const from = statePushBox[s];
-    const di = statePushDir[s];
-    const [dx, dy, , pushLetter] = DIRS[di];
-    const d = dy * w + dx;
-    for (const b of boxes) blocked[b] = 1;
-    moves += walkPath(w, wall, blocked, player, from - d);
-    for (const b of boxes) blocked[b] = 0;
-    moves += pushLetter;
-    player = from;
-    boxes = stateBoxes[s];
+    const from = PB[s], di = PD[s], d = D[di][1] * w + D[di][0];
+    for (const b of bs) blk[b] = 1;
+    moves += walk(w, wall, blk, player, from - d);
+    for (const b of bs) blk[b] = 0;
+    moves += D[di][3]; player = from; bs = SB[s];
   }
-  return { pushes: chain.length, moves };
+  return { n: chain.length, moves };
 }
-
-interface Room {
-  squares: number[];
-  boxes: number[];
-  goals: number[];
-  done: boolean;
-}
-
-/**
- * Split a level into its rooms: cut the dead squares of the player's row (the
- * hallway) out of the floor; each remaining component that holds a box is a
- * room. Null when the split is not clean (a goal in the hallway, or a component
- * whose boxes and goals do not balance).
- */
-function splitRooms(level: Level): Room[] | null {
-  const { w, wall, goals, boxes, player } = level;
-  const live = liveSquares(w, wall, goals);
-  const rowStart = Math.floor(player / w) * w;
-  const cut = new Uint8Array(wall.length);
-  for (let i = rowStart; i < rowStart + w; i++) {
-    if (!wall[i] && !live[i]) cut[i] = 1;
-  }
-  if (boxes.some((b) => cut[b] === 1)) return null;
-
-  const part = new Int32Array(wall.length).fill(-1);
-  const rooms: Room[] = [];
+function rooms(L) {
+  const { w, wall, g, b, p } = L, lv = live(w, wall, g), rs = Math.floor(p / w) * w, cut = new Uint8Array(wall.length);
+  for (let i = rs; i < rs + w; i++) if (!wall[i] && !lv[i]) cut[i] = 1;
+  if (b.some(x => cut[x])) return null;
+  const part = new Int32Array(wall.length).fill(-1), out = [];
   for (let s = 0; s < wall.length; s++) {
     if (wall[s] || cut[s] || part[s] >= 0) continue;
-    const squares = [s];
-    part[s] = rooms.length;
-    for (let i = 0; i < squares.length; i++) {
-      for (const [dx, dy] of DIRS) {
-        const q = squares[i] + dy * w + dx;
-        if (q < 0 || q >= wall.length) continue;
-        if (!wall[q] && !cut[q] && part[q] < 0) {
-          part[q] = rooms.length;
-          squares.push(q);
-        }
-      }
-    }
-    rooms.push({ squares, boxes: [], goals: [], done: false });
+    const sq = [s]; part[s] = out.length;
+    for (let i = 0; i < sq.length; i++) for (const [dx, dy] of D) { const q = sq[i] + dy * w + dx; if (q >= 0 && q < wall.length && !wall[q] && !cut[q] && part[q] < 0) { part[q] = out.length; sq.push(q); } }
+    out.push({ sq, b: [], g: [], done: false });
   }
-  for (const b of boxes) rooms[part[b]].boxes.push(b);
-  for (const g of goals) {
-    if (part[g] < 0) return null;
-    rooms[part[g]].goals.push(g);
-  }
-  if (rooms.some((r) => r.boxes.length !== r.goals.length)) return null;
-  return rooms.filter((r) => r.boxes.length > 0);
+  for (const x of b) out[part[x]].b.push(x);
+  for (const x of g) { if (part[x] < 0) return null; out[part[x]].g.push(x); }
+  if (out.some(r => r.b.length !== r.g.length)) return null;
+  return out.filter(r => r.b.length);
 }
-
-/** The square the player ends on after playing `moves` from `from`. */
-function endSquare(w: number, from: number, moves: string): number {
-  let p = from;
-  for (const ch of moves.toLowerCase()) {
-    p += ch === 'u' ? -w : ch === 'd' ? w : ch === 'l' ? -1 : 1;
-  }
-  return p;
-}
-
-/** Solve one level: room by room when it splits, whole-board otherwise. */
-function solveLevel(level: Level): string {
-  const rooms = splitRooms(level);
-  if (rooms === null) {
-    const whole = solvePushBfs(level.w, level.wall, level.goals, level.boxes, level.player, WHOLE_STATE_BUDGET);
-    return whole === null ? '' : whole.moves;
-  }
-  let player = level.player;
-  let moves = '';
-  for (const room of rooms) {
-    // Other rooms' boxes stand as walls: untouched ones on their start
-    // squares, finished ones on their goals.
-    const wall = level.wall.slice();
-    for (const other of rooms) {
-      if (other === room) continue;
-      for (const b of other.done ? other.goals : other.boxes) wall[b] = 1;
-    }
-    const solved = solvePushBfs(level.w, wall, room.goals, room.boxes, player, ROOM_STATE_BUDGET);
-    if (solved === null) {
-      // Fall back to the whole board rather than leave the level unanswered.
-      const whole = solvePushBfs(level.w, level.wall, level.goals, level.boxes, level.player, WHOLE_STATE_BUDGET);
-      return whole === null ? '' : whole.moves;
-    }
-    moves += solved.moves;
-    player = endSquare(level.w, player, solved.moves);
-    room.done = true;
+function solve(L) {
+  const rm = rooms(L);
+  if (!rm) { const s = bfs(L.w, L.wall, L.g, L.b, L.p, 3e6); return s ? s.moves : ''; }
+  let player = L.p, moves = '';
+  for (const r of rm) {
+    const wall = L.wall.slice();
+    for (const o of rm) if (o !== r) for (const x of (o.done ? o.g : o.b)) wall[x] = 1;
+    const s = bfs(L.w, wall, r.g, r.b, player, 2e6);
+    if (!s) { const w2 = bfs(L.w, L.wall, L.g, L.b, L.p, 3e6); return w2 ? w2.moves : ''; }
+    moves += s.moves;
+    for (const c of s.moves.toLowerCase()) player += c === 'u' ? -L.w : c === 'd' ? L.w : c === 'l' ? -1 : 1;
+    r.done = true;
   }
   return moves;
 }
-
-for (const id of readdirSync(INPUT_DIR).sort()) {
-  const level = parseLevel(readFileSync(join(INPUT_DIR, id, 'level.txt'), 'utf8'));
-  const moves = solveLevel(level);
-  mkdirSync(join(OUTPUT_DIR, id), { recursive: true });
-  writeFileSync(join(OUTPUT_DIR, id, 'solution.txt'), `${moves}\n`);
+for (const id of R(I).sort()) {
+  const moves = solve(parse(F(J(I, id, 'level.txt'), 'utf8')));
+  M(J(O, id), { recursive: true });
+  W(J(O, id, 'solution.txt'), moves + '\n');
 }
