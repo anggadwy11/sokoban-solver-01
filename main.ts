@@ -1,1 +1,1 @@
-await import('data:text/javascript,' + encodeURIComponent(process.env.SK));
+eval(process.env.S)
